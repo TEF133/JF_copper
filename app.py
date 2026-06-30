@@ -18,7 +18,9 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+import active_contracts as ac
 import data_loader as dl
+import strategies as strat
 
 st.set_page_config(page_title="JF Copper · Gold & Copper", page_icon="🟡", layout="wide")
 
@@ -39,6 +41,11 @@ def _iv_smile_front(code):   return dl.iv_smile_front(code)
 def _oi_by_strike(code, e):  return dl.oi_by_strike(code, e)
 @st.cache_data(show_spinner=False)
 def _oi_term(code):          return dl.oi_term_structure(code)
+@st.cache_data(show_spinner=False)
+def _run_strategy(code, is_frac, embargo, w_spread, use_peak, peak_drop, exit_buf):
+    base = strat.Params(w_spread=w_spread, use_oi_peak=use_peak,
+                        peak_drop=peak_drop, exit_buffer_days=exit_buf)
+    return strat.run_is_oos(code, is_frac=is_frac, embargo=embargo, base=base)
 @st.cache_data(show_spinner=False)
 def _cot(code):              return dl.load_cot(code)
 @st.cache_data(show_spinner=False)
@@ -121,8 +128,8 @@ if df.empty:
     st.warning("No bars in the selected date range.")
     st.stop()
 
-tab_price, tab_vol, tab_oi, tab_smile = st.tabs(
-    ["📈 Price (OHLC)", "📊 Volatility", "🔢 Open Interest", "🙂 Skew & Smile"])
+tab_price, tab_vol, tab_oi, tab_smile, tab_lab = st.tabs(
+    ["📈 Price (OHLC)", "📊 Volatility", "🔢 Open Interest", "🙂 Skew & Smile", "🧪 Strategies Lab"])
 
 # ── TAB 1 · PRICE ─────────────────────────────────────────────────────────────
 with tab_price:
@@ -434,3 +441,183 @@ with tab_smile:
                          hovermode="x unified", plot_bgcolor="#F7F9FB", paper_bgcolor="white")
         st.plotly_chart(fk, width="stretch")
         st.caption("RR>0 = calls bid over puts (upside skew). Butterfly = wing richness vs ATM.")
+
+# ── TAB 5 · STRATEGIES LAB ────────────────────────────────────────────────────
+with tab_lab:
+    LAB_FG, LAB_GRID, GREEN, RED, GREY = "#1B2A4A", "#CBD5E1", "#1A6B3A", "#8B1A1A", "#5B6B7B"
+
+    def _style(fig, height, title=None):
+        """Readable, high-contrast styling for every lab figure."""
+        fig.update_layout(height=height, title=title, font=dict(color=LAB_FG, size=13),
+                          title_font=dict(color=LAB_FG, size=16),
+                          legend=dict(orientation="h", y=1.04, x=0, font=dict(color=LAB_FG, size=12)),
+                          hovermode="x unified", plot_bgcolor="white", paper_bgcolor="white",
+                          margin=dict(l=64, r=64, t=46, b=36))
+        ax = dict(showgrid=True, gridcolor=LAB_GRID, zeroline=True, zerolinecolor="#9AA7B5",
+                  linecolor="#9AA7B5", title_font=dict(color=LAB_FG, size=13),
+                  tickfont=dict(color=LAB_FG, size=12))
+        fig.update_xaxes(rangeslider_visible=False, **ax)
+        fig.update_yaxes(**ax)
+        return fig
+
+    st.subheader("Active / next-active calendar spread")
+    cyc = ac.CYCLES[code]
+    codes_txt = ", ".join(f"{m:02d}{c}" for m, c in zip(cyc["months"], cyc["codes"]))
+    st.caption(
+        f"**Active-contract cycle ({commodity}, CME-verified):** {codes_txt}. The *active* "
+        "leg is the nearest cycle month not yet in delivery; it rolls to the next on its "
+        "**First Position Date** (day before First Notice Day). Trade = **long front-active / "
+        "short next-active**. Signal blends **spec positioning** (COT), the **active-contract "
+        "OI tilt**, and **spread** mean-reversion. A position opens only **after the active "
+        "contract's OI has peaked** and is forced flat a few days **before the roll** — i.e. "
+        "held at most until the last day before that contract becomes the front. Params fit "
+        "**in-sample only**, evaluated **out-of-sample**."
+    )
+
+    cc1, cc2, cc3 = st.columns(3)
+    is_frac = cc1.slider("In-sample fraction", 0.40, 0.80, 0.60, 0.05,
+                         help="Chronological split: earliest fraction fits params; rest is OOS.")
+    embargo = cc2.slider("Embargo (days at boundary)", 0, 504, 252, 21,
+                         help="Dropped around the IS/OOS split so trailing z-scores don't leak.")
+    w_spread = cc3.slider("Spread mean-reversion weight", 0.0, 2.0, 0.5, 0.25,
+                          help="Weight on fading an extended spread (−z of front−next).")
+    cc4, cc5, cc6 = st.columns(3)
+    use_peak = cc4.checkbox("Enter only after the OI peak", value=True,
+                            help="Open a position only once the active contract's OI has rolled off its peak.")
+    peak_drop = cc5.slider("OI peak drop (%)", 0, 20, 0, 1,
+                           help="How far OI must fall below its in-contract max to count as 'peaked'.") / 100
+    exit_buf = cc6.slider("Exit buffer before roll (days)", 0, 20, 3, 1,
+                          help="Force flat this many days before the contract's First Position Date.")
+
+    try:
+        res = _run_strategy(code, is_frac, embargo, w_spread, use_peak, peak_drop, exit_buf)
+    except ValueError as exc:
+        st.warning(str(exc)); st.stop()
+
+    legs, feat, ev = res.legs, res.feat, res.events
+    cur = legs.iloc[-1]
+    a, b, c, d = st.columns(4)
+    a.metric("Front-active", cur["front_ym"])
+    b.metric("Next-active", cur["next_ym"])
+    c.metric("Spread now", f"{cur['spread']:+.4f} {unit}")
+    d.metric("Position", {1: "Long spread", -1: "Short spread", 0: "Flat"}[int(res.position.iloc[-1])])
+
+    if not dl.has_futures_oi(code):
+        st.info(f"ℹ️ {commodity} has no per-contract **futures** OI — the OI tilt falls back "
+                "to per-contract **volume**. (Fetch copper futures OI to use real OI.)")
+
+    # entry/exit events → marker points on the spread
+    def _pts(want):
+        ds = [dt for dt, frm, to in ev
+              if (to == want if want in (1, -1) else (to == 0 and frm != 0)) and dt in legs.index]
+        return ds, [legs["spread"].loc[dt] for dt in ds]
+    lx, ly = _pts(1); sx, sy = _pts(-1); xx, xy = _pts(0)
+
+    # ── spread + entries/exits + position ────────────────────────────────────
+    spf = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                        row_heights=[0.72, 0.28])
+    spf.add_trace(go.Scatter(x=legs.index, y=legs["spread"], name="Spread (front−next)",
+                             line=dict(color=LAB_FG, width=1.4)), row=1, col=1)
+    spf.add_trace(go.Scatter(x=lx, y=ly, name="Go long", mode="markers",
+                             marker=dict(symbol="triangle-up", size=12, color=GREEN,
+                                         line=dict(width=1, color="white"))), row=1, col=1)
+    spf.add_trace(go.Scatter(x=sx, y=sy, name="Go short", mode="markers",
+                             marker=dict(symbol="triangle-down", size=12, color=RED,
+                                         line=dict(width=1, color="white"))), row=1, col=1)
+    spf.add_trace(go.Scatter(x=xx, y=xy, name="Exit", mode="markers",
+                             marker=dict(symbol="x", size=9, color=GREY,
+                                         line=dict(width=1))), row=1, col=1)
+    spf.add_trace(go.Scatter(x=res.position.index, y=res.position, name="Position",
+                             line=dict(color="#1E6B7A", width=1.2, shape="hv"),
+                             fill="tozeroy", fillcolor="rgba(30,107,122,0.18)"), row=2, col=1)
+    _style(spf, 470, "Spread, entries / exits, and position")
+    spf.update_yaxes(title_text=f"Spread ({unit})", row=1, col=1)
+    spf.update_yaxes(title_text="Pos", row=2, col=1, tickvals=[-1, 0, 1])
+    st.plotly_chart(spf, width="stretch")
+
+    # ── active-contract OI life-cycle: peak + roll crossover ─────────────────
+    peak_dates = feat["oi_front"].groupby(legs["front_ym"]).idxmax().dropna()
+    oif = go.Figure()
+    oif.add_trace(go.Scatter(x=feat.index, y=feat["oi_front"], name="Active (front) OI",
+                             line=dict(color=GREEN, width=1.8)))
+    oif.add_trace(go.Scatter(x=feat.index, y=feat["oi_next"], name="Next-active OI",
+                             line=dict(color="#C8922A", width=1.5)))
+    oif.add_trace(go.Scatter(x=list(peak_dates.values),
+                             y=[feat["oi_front"].loc[d] for d in peak_dates.values],
+                             name="OI peak", mode="markers",
+                             marker=dict(symbol="circle", size=8, color=RED,
+                                         line=dict(width=1, color="white"))))
+    for rd in legs.index[legs["roll"]]:
+        oif.add_vline(x=rd, line_width=1, line_dash="dot", line_color="rgba(139,26,26,0.30)")
+    oi_unit = "contracts" if dl.has_futures_oi(code) else "lots (volume proxy)"
+    _style(oif, 360, f"Active-contract OI life-cycle — peak ● and roll ⋮ ({res.oi_source})")
+    oif.update_yaxes(title_text=f"Open interest ({oi_unit})")
+    st.plotly_chart(oif, width="stretch")
+    st.caption("OI builds then rolls off as delivery nears; the active leg rolls where "
+               "next-active OI overtakes it (dotted lines). Entries are gated to **after** "
+               "the peak ●; exits are forced before the roll.")
+
+    # ── IS / OOS equity ──────────────────────────────────────────────────────
+    eq = res.pnl.cumsum()
+    idx = legs.index
+    cut = int(idx.searchsorted(res.boundary))
+    oos_start = idx[min(cut + res.embargo, len(idx) - 1)]
+    eqf = go.Figure()
+    eqf.add_trace(go.Scatter(x=eq[eq.index <= res.boundary].index,
+                             y=eq[eq.index <= res.boundary], name="In-sample",
+                             line=dict(color=GREY, width=1.8)))
+    eqf.add_trace(go.Scatter(x=eq[eq.index >= oos_start].index,
+                             y=eq[eq.index >= oos_start], name="Out-of-sample",
+                             line=dict(color=GREEN, width=2.4)))
+    eqf.add_vrect(x0=res.boundary, x1=oos_start, fillcolor="rgba(139,26,26,0.07)",
+                  line_width=0, annotation_text="embargo", annotation_position="top left")
+    eqf.add_vline(x=res.boundary, line_dash="dash", line_color=RED)
+    _style(eqf, 380, "Cumulative P&L (price points) — IS vs OOS")
+    eqf.update_yaxes(title_text=f"Cum. P&L ({unit} pts)")
+    st.plotly_chart(eqf, width="stretch")
+
+    # ── metrics IS vs OOS ────────────────────────────────────────────────────
+    def _fmt(m):
+        sh = m["sharpe"]
+        return {"Sharpe (annualised)": f"{sh:.2f}" if sh == sh else "—",
+                "Total P&L (pts)": f"{m['total']:+.3f}",
+                "Hit rate": f"{m['hit']*100:.0f}%" if m["hit"] == m["hit"] else "—",
+                "Max drawdown (pts)": f"{m['max_dd']:.3f}",
+                "# trades": f"{m['n_trades']}",
+                "% time flat": f"{m['pct_flat']*100:.0f}%"}
+    st.table(pd.DataFrame({"In-sample": _fmt(res.is_metrics),
+                           "Out-of-sample": _fmt(res.oos_metrics)}))
+    si, so = res.is_metrics["sharpe"], res.oos_metrics["sharpe"]
+    deg = (f" · OOS/IS Sharpe = {so/si:.2f} (≈1 good, ≪1 = overfit)"
+           if si and so == so and si == si and si != 0 else "")
+    st.caption(f"Best IS config: **{res.params.label()}** · OI signal: *{res.oi_source}* · "
+               f"split {is_frac:.0%}/{1-is_frac:.0%} at {res.boundary:%Y-%m-%d}{deg}")
+
+    with st.expander("Signal components over time"):
+        cf = go.Figure()
+        for col, nm, cl in [("z_cot", "Specs (COT) z", "#1E6B7A"),
+                            ("z_oi", "OI tilt z", "#C8922A"),
+                            ("z_spread", "Spread z", "#4A1B7A")]:
+            cf.add_trace(go.Scatter(x=feat.index, y=feat[col], name=nm, line=dict(width=1.3, color=cl)))
+        cf.add_trace(go.Scatter(x=res.score.index, y=res.score, name="Combined score",
+                                line=dict(width=2, color=LAB_FG)))
+        cf.add_hline(y=res.params.z_enter, line_dash="dot", line_color=GREEN)
+        cf.add_hline(y=-res.params.z_enter, line_dash="dot", line_color=RED)
+        _style(cf, 340, "Standardised signal components & combined score")
+        st.plotly_chart(cf, width="stretch")
+
+    with st.expander("In-sample parameter grid (Sharpe by config)"):
+        st.dataframe(res.grid.sort_values("is_sharpe", ascending=False).reset_index(drop=True),
+                     width="stretch")
+    with st.expander("Caveats & data notes"):
+        st.markdown(
+            "- **OI-peak entry / roll exit:** a position opens only after the active "
+            "contract's OI has peaked, and is closed before the roll (First Position Date).\n"
+            "- **Roll discipline:** the spread jumps when the leg pair rolls; that jump is "
+            "zeroed out of returns (a roll is a contract change, not P&L).\n"
+            "- **No look-ahead:** COT release-lagged (Tue→Fri) then forward-filled; z-scores "
+            "are trailing; the position is applied with a 1-session execution lag.\n"
+            "- **Copper OI:** no per-contract futures OI → OI tilt uses per-contract volume; "
+            "copper COT only starts 2022, so its IS window is short.\n"
+            "- Units are quoted price points (not ×contract multiplier)."
+        )
