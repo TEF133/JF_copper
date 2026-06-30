@@ -26,6 +26,8 @@ UP, DOWN = "#1A6B3A", "#8B1A1A"
 RV_COLORS = ["#1E6B7A", "#C8922A", "#4A1B7A"]
 IV_COLOR, ATR_COLOR, NAVY = "#8B1A1A", "#6B7C93", "#1B2A4A"
 RV_CHOICES = [5, 10, 20, 30, 60, 90, 120]
+MA_PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+              "#8c564b", "#e377c2", "#17becf", "#bcbd22"]
 
 
 # Cache the heavier reads so toggling widgets stays snappy.
@@ -75,8 +77,19 @@ rule, ppy = dl.TIMEFRAMES[timeframe]
 st.sidebar.divider()
 st.sidebar.subheader("Price chart")
 show_volume = st.sidebar.checkbox("Show volume", value=True)
-show_ma = st.sidebar.checkbox("20-bar moving average", value=True)
 log_scale = st.sidebar.checkbox("Log price axis", value=False)
+
+with st.sidebar.expander("Technical analysis", expanded=False):
+    st.caption("Price overlays")
+    sma_periods = st.multiselect("SMA (days)", dl.MA_PERIODS, default=[20])
+    ema_periods = st.multiselect("EMA (days)", dl.MA_PERIODS, default=[])
+    show_bb = st.checkbox("Bollinger Bands (20, 2σ)")
+    show_sar = st.checkbox("Parabolic SAR")
+    st.caption("Oscillators (each adds a panel)")
+    show_rsi = st.checkbox("RSI (14)")
+    show_macd = st.checkbox("MACD (12, 26, 9)")
+    show_stoch = st.checkbox("Stochastic (14, 3)")
+    show_adx = st.checkbox("ADX (14)")
 
 st.sidebar.divider()
 st.sidebar.subheader("Volatility")
@@ -109,24 +122,93 @@ tab_price, tab_vol, tab_oi, tab_smile = st.tabs(
 
 # ── TAB 1 · PRICE ─────────────────────────────────────────────────────────────
 with tab_price:
-    rows = 2 if show_volume else 1
-    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03,
-                        row_heights=[0.78, 0.22] if show_volume else [1.0])
+    def clip(series):                      # indicators computed on full `bars`, shown over [s:e]
+        return series.loc[s:e]
+
+    # Assemble stacked panels: price (+overlays) on top, then volume / oscillators.
+    panels = [("price", 3.0)]
+    if show_volume: panels.append(("volume", 1.0))
+    if show_rsi:    panels.append(("rsi", 1.3))
+    if show_macd:   panels.append(("macd", 1.4))
+    if show_stoch:  panels.append(("stoch", 1.3))
+    if show_adx:    panels.append(("adx", 1.3))
+    weights = [w for _, w in panels]
+    heights = [w / sum(weights) for w in weights]
+    row_of = {name: i + 1 for i, (name, _) in enumerate(panels)}
+    nrows = len(panels)
+
+    fig = make_subplots(rows=nrows, cols=1, shared_xaxes=True, vertical_spacing=0.02,
+                        row_heights=heights)
     fig.add_trace(go.Candlestick(x=df.index, open=df["open"], high=df["high"],
                                  low=df["low"], close=df["close"], name="OHLC",
                                  increasing_line_color=UP, decreasing_line_color=DOWN), row=1, col=1)
-    if show_ma and len(df) >= 20:
-        fig.add_trace(go.Scatter(x=df.index, y=df["close"].rolling(20).mean(), name="20-bar MA",
-                                 line=dict(color=NAVY, width=1.4, dash="dot")), row=1, col=1)
+    # ── price overlays ──
+    for i, n in enumerate(sma_periods):
+        fig.add_trace(go.Scatter(x=df.index, y=clip(dl.sma(bars["close"], n)), name=f"SMA {n}",
+                                 line=dict(color=MA_PALETTE[i % len(MA_PALETTE)], width=1.3)), row=1, col=1)
+    for i, n in enumerate(ema_periods):
+        fig.add_trace(go.Scatter(x=df.index, y=clip(dl.ema(bars["close"], n)), name=f"EMA {n}",
+                                 line=dict(color=MA_PALETTE[i % len(MA_PALETTE)], width=1.3, dash="dash")), row=1, col=1)
+    if show_bb:
+        mid, up_b, lo_b = dl.bollinger(bars["close"], 20, 2)
+        fig.add_trace(go.Scatter(x=df.index, y=clip(up_b), name="BB upper",
+                                 line=dict(color="#999", width=1)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=clip(lo_b), name="BB lower", fill="tonexty",
+                                 fillcolor="rgba(120,120,120,0.10)", line=dict(color="#999", width=1)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=clip(mid), name="BB mid",
+                                 line=dict(color="#999", width=1, dash="dot")), row=1, col=1)
+    if show_sar:
+        sar = clip(dl.parabolic_sar(bars["high"], bars["low"]))
+        fig.add_trace(go.Scatter(x=sar.index, y=sar, name="SAR", mode="markers",
+                                 marker=dict(color=NAVY, size=3)), row=1, col=1)
+    fig.update_yaxes(title_text=f"Price ({unit})", type="log" if log_scale else "linear", row=1, col=1)
+
+    # ── volume ──
     if show_volume:
+        r = row_of["volume"]
         vc = [UP if c >= o else DOWN for o, c in zip(df["open"], df["close"])]
         fig.add_trace(go.Bar(x=df.index, y=df["volume"], name="Volume", marker_color=vc,
-                             marker_line_width=0, opacity=0.55), row=2, col=1)
-        fig.update_yaxes(title_text="Volume", row=2, col=1)
-    fig.update_yaxes(title_text=f"Price ({unit})", type="log" if log_scale else "linear", row=1, col=1)
+                             marker_line_width=0, opacity=0.55), row=r, col=1)
+        fig.update_yaxes(title_text="Vol", row=r, col=1)
+    # ── RSI ──
+    if show_rsi:
+        r = row_of["rsi"]
+        rv = clip(dl.rsi(bars["close"], 14))
+        fig.add_trace(go.Scatter(x=rv.index, y=rv, name="RSI", line=dict(color="#4A1B7A", width=1.4)), row=r, col=1)
+        fig.add_hline(y=70, line=dict(color="#bbb", dash="dot"), row=r, col=1)
+        fig.add_hline(y=30, line=dict(color="#bbb", dash="dot"), row=r, col=1)
+        fig.update_yaxes(title_text="RSI", range=[0, 100], row=r, col=1)
+    # ── MACD ──
+    if show_macd:
+        r = row_of["macd"]
+        line, sig, hist = (clip(x) for x in dl.macd(bars["close"]))
+        hc = [UP if v >= 0 else DOWN for v in hist]
+        fig.add_trace(go.Bar(x=hist.index, y=hist, name="MACD hist", marker_color=hc,
+                             marker_line_width=0, opacity=0.5), row=r, col=1)
+        fig.add_trace(go.Scatter(x=line.index, y=line, name="MACD", line=dict(color=NAVY, width=1.4)), row=r, col=1)
+        fig.add_trace(go.Scatter(x=sig.index, y=sig, name="signal", line=dict(color="#C8922A", width=1.2)), row=r, col=1)
+        fig.update_yaxes(title_text="MACD", row=r, col=1)
+    # ── Stochastic ──
+    if show_stoch:
+        r = row_of["stoch"]
+        k, d = (clip(x) for x in dl.stochastic(bars["high"], bars["low"], bars["close"], 14, 3))
+        fig.add_trace(go.Scatter(x=k.index, y=k, name="%K", line=dict(color="#1E6B7A", width=1.3)), row=r, col=1)
+        fig.add_trace(go.Scatter(x=d.index, y=d, name="%D", line=dict(color="#8B1A1A", width=1.1)), row=r, col=1)
+        fig.add_hline(y=80, line=dict(color="#bbb", dash="dot"), row=r, col=1)
+        fig.add_hline(y=20, line=dict(color="#bbb", dash="dot"), row=r, col=1)
+        fig.update_yaxes(title_text="Stoch", range=[0, 100], row=r, col=1)
+    # ── ADX ──
+    if show_adx:
+        r = row_of["adx"]
+        adx_, pdi, mdi = (clip(x) for x in dl.adx(bars["high"], bars["low"], bars["close"], 14))
+        fig.add_trace(go.Scatter(x=adx_.index, y=adx_, name="ADX", line=dict(color=NAVY, width=1.6)), row=r, col=1)
+        fig.add_trace(go.Scatter(x=pdi.index, y=pdi, name="+DI", line=dict(color=UP, width=1)), row=r, col=1)
+        fig.add_trace(go.Scatter(x=mdi.index, y=mdi, name="−DI", line=dict(color=DOWN, width=1)), row=r, col=1)
+        fig.update_yaxes(title_text="ADX", row=r, col=1)
+
     fig.update_xaxes(rangeslider_visible=False)
-    fig.update_layout(height=640, margin=dict(l=50, r=20, t=30, b=30),
-                      legend=dict(orientation="h", y=1.02, x=0),
+    fig.update_layout(height=int(380 + 150 * (nrows - 1)), margin=dict(l=50, r=20, t=30, b=30),
+                      legend=dict(orientation="h", y=1.02, x=0), barmode="overlay",
                       plot_bgcolor="#F7F9FB", paper_bgcolor="white")
     st.plotly_chart(fig, width="stretch")
 

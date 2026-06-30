@@ -8,7 +8,7 @@ then explore four tabs:
 
 | Tab | Shows |
 |-----|-------|
-| 📈 **Price (OHLC)** | Candlesticks + volume + 20-bar MA, log axis option. |
+| 📈 **Price (OHLC)** | Candlesticks + volume + per-indicator technical analysis: SMA/EMA (5…200), Bollinger Bands, Parabolic SAR, and RSI / MACD / Stochastic / ADX oscillator panels. |
 | 📊 **Volatility** | Realised vol (up to 3 windows), ATM implied vol, N-bar ATR, IV−RV spread. |
 | 🔢 **Open Interest** | Options OI by strike (calls vs puts), OI across the curve, total OI over time. |
 | 🙂 **Skew & Smile** | Per-strike IV smile (Black-76 inverted from settles) + 25Δ risk-reversal / butterfly over time. |

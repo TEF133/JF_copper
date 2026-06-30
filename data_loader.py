@@ -312,3 +312,93 @@ def iv_smile_front(code: str) -> tuple[pd.DataFrame, dict]:
     meta = {"snapshot": snap.date().isoformat(), "expiry": exp.date().isoformat(),
             "F": F, "T_years": round(T, 4)}
     return out, meta
+
+
+# ── TECHNICAL INDICATORS (computed from OHLC) ─────────────────────────────────
+MA_PERIODS = [5, 8, 10, 12, 20, 30, 50, 100, 200]
+
+
+def sma(close: pd.Series, n: int) -> pd.Series:
+    return close.rolling(n, min_periods=n).mean()
+
+
+def ema(close: pd.Series, n: int) -> pd.Series:
+    return close.ewm(span=n, adjust=False, min_periods=n).mean()
+
+
+def bollinger(close: pd.Series, n: int = 20, k: float = 2.0):
+    """Returns (mid, upper, lower) Bollinger Bands."""
+    mid = close.rolling(n, min_periods=n).mean()
+    sd = close.rolling(n, min_periods=n).std()
+    return mid, mid + k * sd, mid - k * sd
+
+
+def rsi(close: pd.Series, n: int = 14) -> pd.Series:
+    """Wilder's RSI (0-100)."""
+    delta = close.diff()
+    up = delta.clip(lower=0.0)
+    down = -delta.clip(upper=0.0)
+    roll_up = up.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+    roll_down = down.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+    rs = roll_up / roll_down.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+
+def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    """Returns (macd_line, signal_line, histogram)."""
+    line = ema(close, fast) - ema(close, slow)
+    sig = line.ewm(span=signal, adjust=False).mean()
+    return line, sig, line - sig
+
+
+def stochastic(high: pd.Series, low: pd.Series, close: pd.Series, k: int = 14, d: int = 3):
+    """Returns (%K, %D) stochastic oscillator (0-100)."""
+    ll = low.rolling(k, min_periods=k).min()
+    hh = high.rolling(k, min_periods=k).max()
+    pct_k = 100 * (close - ll) / (hh - ll).replace(0, np.nan)
+    return pct_k, pct_k.rolling(d, min_periods=d).mean()
+
+
+def adx(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14):
+    """Returns (ADX, +DI, -DI) — Wilder's directional system."""
+    up = high.diff()
+    dn = -low.diff()
+    plus_dm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=high.index)
+    minus_dm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=high.index)
+    prev_c = close.shift()
+    tr = pd.concat([(high - low).abs(), (high - prev_c).abs(), (low - prev_c).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr
+    minus_di = 100 * minus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return dx.ewm(alpha=1 / n, adjust=False, min_periods=n).mean(), plus_di, minus_di
+
+
+def parabolic_sar(high: pd.Series, low: pd.Series, step: float = 0.02, max_step: float = 0.2) -> pd.Series:
+    """Wilder's Parabolic SAR (stop-and-reverse), returned as a price series."""
+    h, l = high.to_numpy(dtype=float), low.to_numpy(dtype=float)
+    n = len(h)
+    out = np.full(n, np.nan)
+    if n < 2:
+        return pd.Series(out, index=high.index)
+    up = h[1] >= h[0]
+    af = step
+    ep = h[0] if up else l[0]
+    sar = l[0] if up else h[0]
+    out[0] = sar
+    for i in range(1, n):
+        sar = sar + af * (ep - sar)
+        if up:
+            sar = min(sar, l[i - 1], l[i - 2] if i >= 2 else l[i - 1])
+            if l[i] < sar:                       # reverse to down
+                up, sar, ep, af = False, ep, l[i], step
+            elif h[i] > ep:
+                ep, af = h[i], min(af + step, max_step)
+        else:
+            sar = max(sar, h[i - 1], h[i - 2] if i >= 2 else h[i - 1])
+            if h[i] > sar:                       # reverse to up
+                up, sar, ep, af = True, ep, h[i], step
+            elif l[i] < ep:
+                ep, af = l[i], min(af + step, max_step)
+        out[i] = sar
+    return pd.Series(out, index=high.index)
