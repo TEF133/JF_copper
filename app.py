@@ -18,8 +18,11 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+import numpy as np
+
 import active_contracts as ac
 import data_loader as dl
+import overfitting as ov
 import strategies as strat
 
 st.set_page_config(page_title="JF Copper · Gold & Copper", page_icon="🟡", layout="wide")
@@ -42,10 +45,15 @@ def _oi_by_strike(code, e):  return dl.oi_by_strike(code, e)
 @st.cache_data(show_spinner=False)
 def _oi_term(code):          return dl.oi_term_structure(code)
 @st.cache_data(show_spinner=False)
-def _run_strategy(code, is_frac, embargo, w_spread, use_peak, peak_drop, exit_buf):
-    base = strat.Params(w_spread=w_spread, use_oi_peak=use_peak,
-                        peak_drop=peak_drop, exit_buffer_days=exit_buf)
+def _run_strategy(code, is_frac, embargo, w_spread, use_peak, peak_drop, exit_buf, cot_actor, shock_k):
+    base = strat.Params(w_spread=w_spread, use_oi_peak=use_peak, peak_drop=peak_drop,
+                        exit_buffer_days=exit_buf, cot_actor=cot_actor, shock_k=shock_k)
     return strat.run_is_oos(code, is_frac=is_frac, embargo=embargo, base=base)
+@st.cache_data(show_spinner=False)
+def _grid_matrix(code, w_spread, use_peak, peak_drop, exit_buf, cot_actor, shock_k):
+    base = strat.Params(w_spread=w_spread, use_oi_peak=use_peak, peak_drop=peak_drop,
+                        exit_buffer_days=exit_buf, cot_actor=cot_actor, shock_k=shock_k)
+    return strat.grid_pnl_matrix(code, base)
 @st.cache_data(show_spinner=False)
 def _cot(code):              return dl.load_cot(code)
 @st.cache_data(show_spinner=False)
@@ -481,16 +489,26 @@ with tab_lab:
                          help="Dropped around the IS/OOS split so trailing z-scores don't leak.")
     w_spread = cc3.slider("Spread mean-reversion weight", 0.0, 2.0, 0.5, 0.25,
                           help="Weight on fading an extended spread (−z of front−next).")
-    cc4, cc5, cc6 = st.columns(3)
-    use_peak = cc4.checkbox("Enter only after the OI peak", value=True,
+    cc4, cc5, cc6, cc7 = st.columns(4)
+    actor_keys = list(strat.COT_ACTORS)
+    cot_actor = cc4.selectbox("COT trader group", actor_keys,
+                              index=actor_keys.index("producer"),
+                              format_func=lambda k: strat.COT_ACTORS[k][2],
+                              help="Which CFTC group drives the positioning signal. "
+                                   "Empirically producers (commercials) predict the spread best; "
+                                   "managed money (specs) is weak/contrarian.")
+    use_peak = cc5.checkbox("Enter only after the OI peak", value=True,
                             help="Open a position only once the active contract's OI has rolled off its peak.")
-    peak_drop = cc5.slider("OI peak drop (%)", 0, 20, 0, 1,
+    peak_drop = cc6.slider("OI peak drop (%)", 0, 20, 0, 1,
                            help="How far OI must fall below its in-contract max to count as 'peaked'.") / 100
-    exit_buf = cc6.slider("Exit buffer before roll (days)", 0, 20, 3, 1,
+    exit_buf = cc7.slider("Exit buffer before roll (days)", 0, 20, 3, 1,
                           help="Force flat this many days before the contract's First Position Date.")
+    shock_k = st.slider("Remove big shocks — cap daily Δspread at ×σ (0 = off)", 0.0, 6.0, 0.0, 0.5,
+                        help="Caps each day's spread move at k×trailing-σ (past vol only, no look-ahead) "
+                             "to trim tail shocks and lift the Sharpe. Lower = more aggressive.")
 
     try:
-        res = _run_strategy(code, is_frac, embargo, w_spread, use_peak, peak_drop, exit_buf)
+        res = _run_strategy(code, is_frac, embargo, w_spread, use_peak, peak_drop, exit_buf, cot_actor, shock_k)
     except ValueError as exc:
         st.warning(str(exc)); st.stop()
 
@@ -593,9 +611,86 @@ with tab_lab:
     st.caption(f"Best IS config: **{res.params.label()}** · OI signal: *{res.oi_source}* · "
                f"split {is_frac:.0%}/{1-is_frac:.0%} at {res.boundary:%Y-%m-%d}{deg}")
 
+    # ── OVERFITTING DIAGNOSTICS ──────────────────────────────────────────────
+    st.markdown("#### Overfitting diagnostics")
+    mat = _grid_matrix(code, w_spread, use_peak, peak_drop, exit_buf, cot_actor, shock_k)
+    idx = legs.index
+    cut = int(idx.searchsorted(res.boundary))
+    is_idx, oos_idx = idx[:cut], idx[min(cut + res.embargo, len(idx) - 1):]
+
+    def _csh(col, ix):
+        r = mat[col].reindex(ix).dropna()
+        return r.mean() / r.std() * np.sqrt(252) if len(r) > 10 and r.std() > 0 else np.nan
+    is_s = np.array([_csh(c, is_idx) for c in mat.columns])
+    oos_s = np.array([_csh(c, oos_idx) for c in mat.columns])
+    ok = ~np.isnan(is_s) & ~np.isnan(oos_s)
+    corr = np.corrcoef(is_s[ok], oos_s[ok])[0, 1] if ok.sum() > 2 else np.nan
+
+    pbo = ov.pbo_cscv(mat, s=10)
+    trial_sr = np.array([(mat[c].dropna().mean() / mat[c].dropna().std())
+                         if mat[c].dropna().std() > 0 else np.nan for c in mat.columns])
+    dsr = ov.deflated_sharpe(res.pnl, trial_sr)
+    em, words = ov.verdict(pbo["pbo"], dsr["dsr"])
+    si, so = res.is_metrics["sharpe"], res.oos_metrics["sharpe"]
+    degr = so / si if si and si == si and si != 0 and so == so else float("nan")
+
+    o1, o2, o3, o4 = st.columns(4)
+    o1.metric("PBO", f"{pbo['pbo']*100:.0f}%" if pbo["pbo"] == pbo["pbo"] else "—",
+              help="Probability of Backtest Overfitting (CSCV). Fraction of folds where the "
+                   "in-sample-best config lands below median out-of-sample. <30% good, ~50% = chance.")
+    o2.metric("Deflated Sharpe", f"{dsr['dsr']*100:.0f}%" if dsr["dsr"] == dsr["dsr"] else "—",
+              help="Prob. the true Sharpe is >0 after deflating for the number of grid trials, "
+                   "sample length, skew & kurtosis. >90% = confident.")
+    o3.metric("OOS/IS Sharpe", f"{degr:.2f}" if degr == degr else "—",
+              help="Out-of-sample / in-sample Sharpe. ≈1 generalises; ≪1 = degradation.")
+    o4.metric("IS–OOS grid corr", f"{corr:+.2f}" if corr == corr else "—",
+              help="Correlation of IS vs OOS Sharpe across all grid configs. Positive = robust "
+                   "ranking; negative = configs that shine IS tend to fail OOS (overfit).")
+    st.caption(f"{em} **{words}.** Deflated SR uses N={dsr['n_trials']} trials "
+               f"(SR≈{dsr['sr_ann']:+.2f} ann. vs deflated bar {dsr['sr_star_ann']:.2f}; "
+               f"skew {dsr.get('skew', float('nan')):+.2f}, kurtosis {dsr.get('kurt', float('nan')):.0f}). "
+               "Fat tails (high kurtosis) inflate a raw Sharpe — read DSR alongside PBO and the scatter.")
+
+    sel = list(mat.columns).index(res.params.label()) if res.params.label() in list(mat.columns) else None
+    sca = go.Figure()
+    sca.add_trace(go.Scatter(x=is_s, y=oos_s, mode="markers", name="grid configs",
+                             marker=dict(size=8, color="#5B6B7B", opacity=0.75)))
+    if sel is not None:
+        sca.add_trace(go.Scatter(x=[is_s[sel]], y=[oos_s[sel]], mode="markers", name="selected",
+                                 marker=dict(symbol="star", size=16, color="#1A6B3A",
+                                             line=dict(width=1, color="white"))))
+    sca.add_hline(y=0, line_color="#9AA7B5"); sca.add_vline(x=0, line_color="#9AA7B5")
+    _style(sca, 330, f"IS vs OOS Sharpe across {len(mat.columns)} grid configs (corr {corr:+.2f})")
+    sca.update_xaxes(title_text="IS Sharpe"); sca.update_yaxes(title_text="OOS Sharpe")
+    st.plotly_chart(sca, width="stretch")
+
+    # ── CHOOSING σ (shock cap) ───────────────────────────────────────────────
+    st.markdown("#### Choosing the shock cap σ")
+    st.caption("σ is set by the **“Remove big shocks — cap daily Δspread at ×σ”** slider above. "
+               "This curve shows its effect on the **current** config. Pick σ by **IS stability / "
+               "lower drawdown**, not by chasing the OOS max (that would snoop the test set).")
+    ks = [0.0, 6.0, 5.0, 4.0, 3.0, 2.5, 2.0, 1.5]
+    sweep = strat.shock_sweep(code, res.params, ks, is_frac, embargo).sort_values("k")
+    xv = sweep["k"].to_numpy()
+    xlab = ["off" if k == 0 else f"{k:g}σ" for k in xv]
+    swf = make_subplots(specs=[[{"secondary_y": True}]])
+    swf.add_trace(go.Bar(x=xv, y=sweep["oos_maxdd"], name="OOS max drawdown",
+                         marker_color="rgba(139,26,26,0.30)"), secondary_y=True)
+    swf.add_trace(go.Scatter(x=xv, y=sweep["is_sharpe"], name="IS Sharpe",
+                             line=dict(color="#5B6B7B", width=2)), secondary_y=False)
+    swf.add_trace(go.Scatter(x=xv, y=sweep["oos_sharpe"], name="OOS Sharpe",
+                             line=dict(color="#1A6B3A", width=2.4)), secondary_y=False)
+    _style(swf, 340, "Sharpe & drawdown vs shock cap (current config)")
+    swf.update_xaxes(tickvals=xv, ticktext=xlab, title_text="shock cap (×σ)")
+    swf.update_yaxes(title_text="Sharpe", secondary_y=False)
+    swf.update_yaxes(title_text=f"OOS max DD ({unit} pts)", secondary_y=True, showgrid=False)
+    swf.add_vline(x=float(shock_k), line_dash="dash", line_color="#1B2A4A",
+                  annotation_text="current", annotation_position="top")
+    st.plotly_chart(swf, width="stretch")
+
     with st.expander("Signal components over time"):
         cf = go.Figure()
-        for col, nm, cl in [("z_cot", "Specs (COT) z", "#1E6B7A"),
+        for col, nm, cl in [("z_cot", f"COT {strat.COT_ACTORS[cot_actor][2]} z", "#1E6B7A"),
                             ("z_oi", "OI tilt z", "#C8922A"),
                             ("z_spread", "Spread z", "#4A1B7A")]:
             cf.add_trace(go.Scatter(x=feat.index, y=feat[col], name=nm, line=dict(width=1.3, color=cl)))

@@ -43,9 +43,10 @@ class Params:
     z_window: int = 252        # trailing window for z-scores / OI/COT standardisation
     z_enter: float = 1.0       # |score| above this opens a position
     z_exit: float = 0.25       # |score| below this closes it (hysteresis)
-    w_cot: float = 1.0         # weight on the COT positioning (specs) component
+    w_cot: float = 1.0         # weight on the COT positioning component
     w_oi: float = 1.0          # weight on the OI/volume tilt component
     w_spread: float = 0.5      # weight on the spread mean-reversion component (−z_spread)
+    cot_actor: str = "producer"  # which COT trader group drives the signal (see COT_ACTORS)
     cot_lag_days: int = 3      # COT report→publication lag (Tue→Fri)
     exec_lag: int = 1          # sessions between signal and the position being on
     min_periods: int = 60      # z-score warm-up
@@ -53,11 +54,13 @@ class Params:
     use_oi_peak: bool = True   # only open once the active contract's OI has peaked
     peak_drop: float = 0.0     # "peaked" = OI below (1−peak_drop)·running max in-contract
     exit_buffer_days: int = 3  # force flat this many days before the roll (First Position Date)
+    shock_k: float = 0.0       # cap |Δspread| at k·trailing-σ (0 = off) — trims big shocks
 
     def label(self) -> str:
         return (f"win={self.z_window} enter={self.z_enter} exit={self.z_exit} "
-                f"w=(cot {self.w_cot}, oi {self.w_oi}, sprd {self.w_spread})"
-                f"{' +peak' if self.use_oi_peak else ''} exitBuf={self.exit_buffer_days}d")
+                f"w=(cot {self.w_cot}·{self.cot_actor}, oi {self.w_oi}, sprd {self.w_spread})"
+                f"{' +peak' if self.use_oi_peak else ''} exitBuf={self.exit_buffer_days}d"
+                f"{f' shockCap={self.shock_k}σ' if self.shock_k else ''}")
 
 
 # ── DATA BUILDING ─────────────────────────────────────────────────────────────
@@ -101,12 +104,27 @@ def _trailing_z(s: pd.Series, win: int, min_periods: int) -> pd.Series:
     return (s - mu) / sd.replace(0, np.nan)
 
 
-def cot_norm(code: str, index: pd.DatetimeIndex, lag_days: int) -> pd.Series:
-    """Net spec-vs-commercial positioning, normalised by total OI, release-lagged
-    and forward-filled onto `index`. (managed_money_net - producer_net)/open_interest."""
+# Which COT trader group drives the signal. (column, orientation, label) — the
+# orientation makes a positive component predict a RISING spread (→ long), per the
+# empirical study: producers (commercials) are the strongest predictor; managed
+# money (specs) is weak/contrarian; the old MM−Producer default is near-zero/negative.
+COT_ACTORS = {
+    "producer":          ("producer_net",      +1.0, "Producers (commercials)"),
+    "managed_money":     ("managed_money_net", -1.0, "Managed money (specs)"),
+    "swap":              ("swap_net",          +1.0, "Swap dealers"),
+    "mm_minus_producer": (None,                -1.0, "MM − Producers"),
+}
+
+
+def cot_signal(code: str, index: pd.DatetimeIndex, lag_days: int,
+               actor: str = "producer") -> pd.Series:
+    """A COT trader group's net positioning / total OI, oriented so positive ⇒
+    long-spread, release-lagged and forward-filled onto `index`."""
     cot = dl.load_cot(code)
-    raw = (cot["managed_money_net"] - cot["producer_net"]) / cot["open_interest"].replace(0, np.nan)
-    raw = raw.dropna()
+    col, orient, _ = COT_ACTORS.get(actor, COT_ACTORS["producer"])
+    oi = cot["open_interest"].replace(0, np.nan)
+    net = (cot["managed_money_net"] - cot["producer_net"]) if col is None else cot[col]
+    raw = (orient * net / oi).dropna()
     raw.index = raw.index + pd.Timedelta(days=lag_days)        # shift to release date
     raw = raw[~raw.index.duplicated(keep="last")].sort_index()
     return raw.reindex(index, method="ffill")
@@ -154,7 +172,7 @@ def _oi_peaked(oi_front: pd.Series, front_ym: pd.Series, drop: float) -> pd.Seri
 
 def base_features(code: str, legs: pd.DataFrame, p: Params) -> tuple[pd.DataFrame, str]:
     """All weight-independent inputs (computed once; the grid only re-weights)."""
-    cot = cot_norm(code, legs.index, p.cot_lag_days)
+    cot = cot_signal(code, legs.index, p.cot_lag_days, p.cot_actor)
     oi, source = active_oi(code, legs)
     feat = pd.DataFrame(index=legs.index)
     feat["z_cot"] = _trailing_z(cot, p.z_window, p.min_periods)
@@ -209,10 +227,17 @@ def positions_from_features(feat: pd.DataFrame, score: pd.Series, p: Params):
 
 
 # ── BACKTEST ──────────────────────────────────────────────────────────────────
-def _daily_pnl(legs: pd.DataFrame, position: pd.Series, exec_lag: int) -> pd.Series:
-    """position · Δspread, with roll-day changes zeroed and a 1-session exec lag."""
+def _daily_pnl(legs: pd.DataFrame, position: pd.Series, exec_lag: int,
+               shock_k: float = 0.0) -> pd.Series:
+    """position · Δspread, with roll-day changes zeroed and a 1-session exec lag.
+    If shock_k>0, the daily spread move is capped at ±k·trailing-σ (a per-day
+    shock filter using only past volatility — no look-ahead) to trim fat tails."""
     d_spread = legs["spread"].diff()
     d_spread = d_spread.mask(legs["roll"], 0.0).fillna(0.0)   # roll gap ≠ return
+    if shock_k and shock_k > 0:
+        sig = d_spread.abs().rolling(63, min_periods=20).std().shift(1)   # trailing only
+        cap = (shock_k * sig)
+        d_spread = d_spread.where(cap.isna(), d_spread.clip(lower=-cap, upper=cap))
     return position.shift(exec_lag).fillna(0.0) * d_spread
 
 
@@ -242,7 +267,7 @@ def backtest(code: str, p: Params, legs: pd.DataFrame | None = None,
         feat, source = base_features(code, legs, p)
     score = score_from(feat, p)
     position, events = positions_from_features(feat, score, p)
-    pnl = _daily_pnl(legs, position, p.exec_lag)
+    pnl = _daily_pnl(legs, position, p.exec_lag, p.shock_k)
     return {"legs": legs, "feat": feat, "score": score, "position": position,
             "events": events, "pnl": pnl, "equity": pnl.cumsum(), "source": source}
 
@@ -294,7 +319,7 @@ def run_is_oos(code: str, is_frac: float = 0.60, embargo: int = 252,
     for p in _grid(base):
         score = score_from(feat, p)
         position, _ = positions_from_features(feat, score, p)
-        pnl = _daily_pnl(legs, position, p.exec_lag)
+        pnl = _daily_pnl(legs, position, p.exec_lag, p.shock_k)
         m_is = metrics(pnl.reindex(is_idx), position)
         rows.append({"params": p.label(), "z_enter": p.z_enter, "w_cot": p.w_cot,
                      "w_oi": p.w_oi, "is_sharpe": m_is["sharpe"], "is_trades": m_is["n_trades"]})
@@ -306,7 +331,7 @@ def run_is_oos(code: str, is_frac: float = 0.60, embargo: int = 252,
     p = best if best is not None else replace(base)
     score = score_from(feat, p)
     position, events = positions_from_features(feat, score, p)
-    pnl = _daily_pnl(legs, position, p.exec_lag)
+    pnl = _daily_pnl(legs, position, p.exec_lag, p.shock_k)
     return Result(
         code=code, params=p, legs=legs, feat=feat, score=score, position=position,
         events=events, pnl=pnl, boundary=boundary,
@@ -314,3 +339,40 @@ def run_is_oos(code: str, is_frac: float = 0.60, embargo: int = 252,
         oos_metrics=metrics(pnl.reindex(oos_idx), position),
         grid=pd.DataFrame(rows), oi_source=source, embargo=embargo,
     )
+
+
+# ── DIAGNOSTICS SUPPORT ───────────────────────────────────────────────────────
+def grid_pnl_matrix(code: str, base: Params | None = None) -> pd.DataFrame:
+    """(time × config) daily P&L for every grid config — feeds PBO / DSR / the
+    IS-vs-OOS robustness scatter. Same grid as run_is_oos."""
+    base = base or Params()
+    legs = build_legs(code)
+    feat, _ = base_features(code, legs, base)
+    out = {}
+    for p in _grid(base):
+        score = score_from(feat, p)
+        position, _ = positions_from_features(feat, score, p)
+        out[p.label()] = _daily_pnl(legs, position, p.exec_lag, p.shock_k)
+    return pd.DataFrame(out, index=legs.index)
+
+
+def shock_sweep(code: str, params: Params, ks, is_frac: float = 0.60,
+                embargo: int = 252) -> pd.DataFrame:
+    """IS / OOS Sharpe and OOS max-drawdown vs the shock cap, holding the chosen
+    config fixed (position is independent of the cap; only the P&L is clipped).
+    Use it to pick σ — choose by IS stability / drawdown, NOT by the OOS max."""
+    legs = build_legs(code)
+    feat, _ = base_features(code, legs, params)
+    score = score_from(feat, params)
+    position, _ = positions_from_features(feat, score, params)
+    idx = legs.index
+    cut = int(len(idx) * is_frac)
+    is_idx, oos_idx = idx[:cut], idx[cut + embargo:]
+    rows = []
+    for k in ks:
+        pnl = _daily_pnl(legs, position, params.exec_lag, k)
+        m_is = metrics(pnl.reindex(is_idx), position)
+        m_oos = metrics(pnl.reindex(oos_idx), position)
+        rows.append({"k": k, "is_sharpe": m_is["sharpe"], "oos_sharpe": m_oos["sharpe"],
+                     "oos_maxdd": m_oos["max_dd"]})
+    return pd.DataFrame(rows)
