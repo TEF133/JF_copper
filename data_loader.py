@@ -18,8 +18,10 @@ Both return a tidy OHLC frame indexed by date with columns:
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -97,3 +99,197 @@ def load_fixed(code: str, expiry_ym: str) -> pd.DataFrame:
     df = _read(code, "outright_ohlc")
     df = df[df["expiry_ym"].astype(str) == expiry_ym]
     return df.set_index("date")[_OHLC].dropna(how="all")
+
+
+# ── VOLATILITY MEASURES (computed from OHLC) ──────────────────────────────────
+def realised_vol(close: pd.Series, window: int, periods_per_year: int = 252) -> pd.Series:
+    """Annualised realised volatility (decimal) = rolling std of daily log
+    returns × √252, over `window` days."""
+    log_ret = np.log(close / close.shift(1))
+    return log_ret.rolling(window, min_periods=max(2, window // 2)).std() * np.sqrt(periods_per_year)
+
+
+def atr(ohlc: pd.DataFrame, window: int) -> pd.Series:
+    """N-day Average True Range (in price units). TR = max(H−L, |H−Cprev|, |L−Cprev|)."""
+    high, low, close = ohlc["high"], ohlc["low"], ohlc["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(window, min_periods=max(2, window // 2)).mean()
+
+
+# ── IMPLIED VOL (ATM IV term-structure snapshots) ─────────────────────────────
+def _read_iv(code: str) -> pd.DataFrame:
+    df = pd.read_parquet(_parquet(code, "atm_iv_ts"))
+    df["date"] = pd.to_datetime(df["date"])
+    df["expiry"] = pd.to_datetime(df["expiry"])
+    # Drop non-physical IV (zeros / thin far-contract garbage up to 900%+).
+    df = df[(df["atm_iv"] > 0.01) & (df["atm_iv"] <= 2.0)]
+    return df.sort_values("date")
+
+
+def load_iv_rolling(code: str, rank: int) -> pd.Series:
+    """ATM implied vol (decimal) for a continuous tenor.
+    Rolling rank r (0=front) maps to IV tenor r+1 (1=front)."""
+    df = _read_iv(code)
+    s = df[df["tenor"] == rank + 1].drop_duplicates("date").set_index("date")["atm_iv"]
+    return s.sort_index()
+
+
+def load_iv_fixed(code: str, expiry_ym: str) -> pd.Series:
+    """ATM implied vol (decimal) for a specific outright, matched on the IV
+    row's contract expiry month — so it tracks that one contract over time."""
+    df = _read_iv(code)
+    mask = df["expiry"].dt.strftime("%Y-%m") == expiry_ym
+    s = df[mask].drop_duplicates("date").set_index("date")["atm_iv"]
+    return s.sort_index()
+
+# ── TIMEFRAME RESAMPLING ──────────────────────────────────────────────────────
+# label -> (pandas resample rule or None for raw daily, periods-per-year)
+TIMEFRAMES: dict[str, tuple[str | None, int]] = {
+    "Daily":   (None, 252),
+    "Weekly":  ("W",  52),
+    "Monthly": ("ME", 12),
+}
+
+
+def resample_ohlc(df: pd.DataFrame, rule: str | None) -> pd.DataFrame:
+    """Resample a daily OHLC frame to a coarser bar. rule=None -> unchanged."""
+    if rule is None or df.empty:
+        return df
+    out = df.resample(rule).agg(
+        open=("open", "first"), high=("high", "max"),
+        low=("low", "min"), close=("close", "last"), volume=("volume", "sum"),
+    )
+    return out.dropna(subset=["open"])
+
+
+def resample_last(s: pd.Series, rule: str | None) -> pd.Series:
+    """Resample a daily series to period-end last value. rule=None -> unchanged."""
+    if rule is None or s.empty:
+        return s
+    return s.resample(rule).last()
+
+
+# ── OPEN INTEREST (options chain) ─────────────────────────────────────────────
+def _read_oi(code: str, name: str) -> pd.DataFrame:
+    df = pd.read_parquet(_parquet(code, name))
+    for col in ("snapshot", "expiry", "date"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col])
+    return df
+
+
+def oi_expiries(code: str) -> list[str]:
+    """The near expiries available in the latest OI snapshot (front 3), YYYY-MM-DD."""
+    df = _read_oi(code, "front3_oi")
+    return [d.strftime("%Y-%m-%d") for d in sorted(df["expiry"].unique())]
+
+
+def oi_by_strike(code: str, expiry: str) -> pd.DataFrame:
+    """Latest-snapshot open interest by strike for one expiry, split call/put.
+    Returns columns: strike, call_oi, put_oi, settle_c, settle_p."""
+    df = _read_oi(code, "front3_oi")
+    df = df[df["expiry"].dt.strftime("%Y-%m-%d") == expiry]
+    piv = df.pivot_table(index="strike", columns="right",
+                         values="open_interest", aggfunc="sum").fillna(0.0)
+    piv = piv.rename(columns={"C": "call_oi", "P": "put_oi"})
+    for c in ("call_oi", "put_oi"):
+        if c not in piv.columns:
+            piv[c] = 0.0
+    return piv[["call_oi", "put_oi"]].reset_index().sort_values("strike")
+
+
+def oi_term_structure(code: str) -> pd.DataFrame:
+    """Total open interest per expiry (latest snapshot) — the OI distribution
+    across the curve. Columns: expiry, total_oi."""
+    df = _read_oi(code, "front3_oi")
+    g = df.groupby(df["expiry"].dt.strftime("%Y-%m-%d"))["open_interest"].sum()
+    return g.rename("total_oi").reset_index().rename(columns={"expiry": "expiry"})
+
+
+def oi_history(code: str) -> pd.Series:
+    """Total options open interest over time (sum across all strikes/expiries
+    per date), from the historical chain. Indexed by date."""
+    df = _read_oi(code, "hist_chain_oi")
+    return df.groupby("date")["open_interest"].sum().sort_index()
+
+
+# ── 25-DELTA SKEW (per-tenor smile summary over time) ─────────────────────────
+def load_skew(code: str, rank: int) -> pd.DataFrame:
+    """25Δ skew time-series for a continuous tenor. skew_ts rank is 1-based
+    (1=front), so rolling rank r maps to skew rank r+1.
+    Columns (vol points, %): atm, rr25, fly25 + derived call25_iv / put25_iv."""
+    df = pd.read_parquet(_parquet(code, "skew_ts"))
+    df["date"] = pd.to_datetime(df["date"])
+    df = df[df["rank"] == rank + 1].sort_values("date").set_index("date")
+    out = df[["atm", "rr25", "fly25"]].copy()
+    # RR = callIV - putIV ; BF = (callIV+putIV)/2 - atm  =>  reconstruct wings
+    out["call25_iv"] = out["atm"] + out["fly25"] + out["rr25"] / 2.0
+    out["put25_iv"] = out["atm"] + out["fly25"] - out["rr25"] / 2.0
+    return out
+
+
+# ── BLACK-76 IMPLIED VOL (per-strike smile snapshot) ──────────────────────────
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _b76_price(F: float, K: float, T: float, sigma: float, right: str) -> float:
+    if T <= 0 or sigma <= 0:
+        return max(F - K, 0.0) if right == "C" else max(K - F, 0.0)
+    sq = sigma * math.sqrt(T)
+    d1 = (math.log(F / K) + 0.5 * sigma * sigma * T) / sq
+    d2 = d1 - sq
+    if right == "C":
+        return F * _norm_cdf(d1) - K * _norm_cdf(d2)
+    return K * _norm_cdf(-d2) - F * _norm_cdf(-d1)
+
+
+def implied_vol_b76(price: float, F: float, K: float, T: float, right: str) -> float:
+    """Bisection-invert a Black-76 (option-on-future) price to implied vol.
+    Discounting r≈0 (settles are ~undiscounted). NaN if unsolvable."""
+    if not (price > 0 and F > 0 and K > 0 and T > 0):
+        return np.nan
+    intrinsic = max(F - K, 0.0) if right == "C" else max(K - F, 0.0)
+    if price < intrinsic - 1e-6:
+        return np.nan
+    lo, hi = 1e-4, 5.0
+    p_lo = _b76_price(F, K, T, lo, right) - price
+    p_hi = _b76_price(F, K, T, hi, right) - price
+    if p_lo * p_hi > 0:
+        return np.nan
+    for _ in range(64):
+        mid = 0.5 * (lo + hi)
+        p_mid = _b76_price(F, K, T, mid, right) - price
+        if abs(p_mid) < 1e-7:
+            return mid
+        if p_lo * p_mid <= 0:
+            hi, p_hi = mid, p_mid
+        else:
+            lo, p_lo = mid, p_mid
+    return 0.5 * (lo + hi)
+
+
+def iv_smile_front(code: str) -> tuple[pd.DataFrame, dict]:
+    """Per-strike implied-vol smile for the FRONT contract, inverted from the
+    latest frontmonth OI snapshot (which carries the futures level F).
+    Returns (df[strike, right, iv, open_interest], meta)."""
+    df = _read_oi(code, "frontmonth_oi")
+    snap = df["snapshot"].max()
+    exp = df["expiry"].max()
+    F = float(df["F"].dropna().iloc[0]) if "F" in df.columns and df["F"].notna().any() else np.nan
+    T = max((exp - snap).days, 0) / 365.0
+    rows = []
+    for _, r in df.iterrows():
+        iv = implied_vol_b76(float(r["settle"]), F, float(r["strike"]), T, str(r["right"]))
+        rows.append({"strike": float(r["strike"]), "right": str(r["right"]),
+                     "iv": iv, "open_interest": float(r["open_interest"])})
+    out = pd.DataFrame(rows).dropna(subset=["iv"])
+    # keep a sensible vol band; drop deep-wing garbage
+    out = out[(out["iv"] > 0.01) & (out["iv"] <= 2.0)].sort_values("strike")
+    meta = {"snapshot": snap.date().isoformat(), "expiry": exp.date().isoformat(),
+            "F": F, "T_years": round(T, 4)}
+    return out, meta
