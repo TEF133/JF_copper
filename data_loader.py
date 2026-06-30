@@ -217,6 +217,25 @@ def oi_history(code: str) -> pd.Series:
     return df.groupby("date")["open_interest"].sum().sort_index()
 
 
+# ── FUTURES OPEN INTEREST (CFTC COT) ──────────────────────────────────────────
+COT_POSITIONS = {
+    "managed_money_net": "Managed money (specs)",
+    "producer_net": "Producers (commercials)",
+    "swap_net": "Swap dealers",
+}
+
+
+def load_cot(code: str) -> pd.DataFrame:
+    """Weekly CFTC Commitments-of-Traders for the futures market, indexed by
+    date. Columns: open_interest (total futures OI) + net positioning by group
+    (managed_money_net, producer_net, swap_net)."""
+    df = pd.read_parquet(_parquet(code, "cot"))
+    df["date"] = pd.to_datetime(df["date"])
+    cols = ["open_interest", *COT_POSITIONS]
+    keep = [c for c in cols if c in df.columns]
+    return df.sort_values("date").set_index("date")[keep]
+
+
 # ── 25-DELTA SKEW (per-tenor smile summary over time) ─────────────────────────
 def load_skew(code: str, rank: int) -> pd.DataFrame:
     """25Δ skew time-series for a continuous tenor. skew_ts rank is 1-based

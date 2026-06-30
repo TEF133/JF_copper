@@ -37,6 +37,8 @@ def _iv_smile_front(code):   return dl.iv_smile_front(code)
 def _oi_by_strike(code, e):  return dl.oi_by_strike(code, e)
 @st.cache_data(show_spinner=False)
 def _oi_term(code):          return dl.oi_term_structure(code)
+@st.cache_data(show_spinner=False)
+def _cot(code):              return dl.load_cot(code)
 
 
 # ── SIDEBAR · CONTRACT ────────────────────────────────────────────────────────
@@ -189,7 +191,47 @@ with tab_vol:
 
 # ── TAB 3 · OPEN INTEREST ─────────────────────────────────────────────────────
 with tab_oi:
-    st.caption("Options open interest — COMEX monthly chain (latest snapshot + history).")
+    # ── Futures OI & positioning (CFTC COT) ──────────────────────────────────
+    st.subheader("Futures — open interest & positioning (CFTC COT)")
+    cot = _cot(code).loc[s:e]
+    if cot.empty:
+        st.info("No COT data in the selected date range (try widening it).")
+    else:
+        fc = make_subplots(specs=[[{"secondary_y": True}]])
+        fc.add_trace(go.Scatter(x=cot.index, y=cot["open_interest"], name="Total OI (futures)",
+                                line=dict(color=NAVY, width=2.2), fill="tozeroy",
+                                fillcolor="rgba(27,42,74,0.06)"), secondary_y=False)
+        pos_colors = {"managed_money_net": "#1E6B7A", "producer_net": "#8B1A1A", "swap_net": "#C8922A"}
+        for col, label in dl.COT_POSITIONS.items():
+            if col in cot.columns:
+                fc.add_trace(go.Scatter(x=cot.index, y=cot[col], name=label,
+                                        line=dict(color=pos_colors.get(col), width=1.5)), secondary_y=True)
+        fc.add_hline(y=0, line_color="#999", secondary_y=True)
+        fc.update_yaxes(title_text="Total open interest (contracts)", secondary_y=False)
+        fc.update_yaxes(title_text="Net position (contracts)", secondary_y=True, showgrid=False)
+        fc.update_layout(height=380, margin=dict(l=55, r=55, t=20, b=30),
+                         legend=dict(orientation="h", y=1.04, x=0), hovermode="x unified",
+                         plot_bgcolor="#F7F9FB", paper_bgcolor="white")
+        st.plotly_chart(fc, width="stretch")
+
+        latest = cot.iloc[-1]
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Total futures OI", f"{latest['open_interest']:,.0f}",
+                  help=f"As of {cot.index[-1]:%Y-%m-%d} (weekly CFTC report).")
+        if "managed_money_net" in cot.columns:
+            mm = latest["managed_money_net"]
+            k2.metric("Managed money net", f"{mm:,.0f}", "net long" if mm >= 0 else "net short")
+        if "producer_net" in cot.columns:
+            k3.metric("Producers net", f"{latest['producer_net']:,.0f}")
+        if "swap_net" in cot.columns:
+            k4.metric("Swap dealers net", f"{latest['swap_net']:,.0f}")
+        st.caption("Total OI = all open futures positions (left). Net positioning by trader "
+                   "group on the right axis: managed money = specs, producers = commercial hedgers.")
+
+    st.divider()
+    # ── Options chain OI ─────────────────────────────────────────────────────
+    st.subheader("Options chain — open interest")
+    st.caption("COMEX monthly options (latest snapshot + history).")
     oi_exps = dl.oi_expiries(code)
     sel_exp = st.selectbox("Expiry for strike ladder", oi_exps, key="oi_exp")
     obs = _oi_by_strike(code, sel_exp)
