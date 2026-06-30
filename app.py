@@ -41,6 +41,10 @@ def _oi_by_strike(code, e):  return dl.oi_by_strike(code, e)
 def _oi_term(code):          return dl.oi_term_structure(code)
 @st.cache_data(show_spinner=False)
 def _cot(code):              return dl.load_cot(code)
+@st.cache_data(show_spinner=False)
+def _fut_curve(code):        return dl.futures_oi_curve(code)
+@st.cache_data(show_spinner=False)
+def _fut_series(code, exp):  return dl.futures_oi_series(code, exp)
 
 
 # ── SIDEBAR · CONTRACT ────────────────────────────────────────────────────────
@@ -273,8 +277,44 @@ with tab_vol:
 
 # ── TAB 3 · OPEN INTEREST ─────────────────────────────────────────────────────
 with tab_oi:
-    # ── Futures OI & positioning (CFTC COT) ──────────────────────────────────
-    st.subheader("Futures — open interest & positioning (CFTC COT)")
+    # ── Futures OI by contract (per-expiry exchange OI) ──────────────────────
+    if dl.has_futures_oi(code):
+        st.subheader("Futures — open interest by contract")
+        curve, snap = _fut_curve(code)
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            top = curve.sort_values("open_interest", ascending=False).head(18).sort_values("expiry_ym")
+            fcv = go.Figure(go.Bar(x=top["expiry_ym"], y=top["open_interest"],
+                                   marker_color=NAVY, opacity=0.85))
+            fcv.update_layout(height=330, title=f"OI by futures contract — {snap:%Y-%m-%d}",
+                              margin=dict(l=50, r=20, t=40, b=40), yaxis_title="Open interest",
+                              xaxis_title="Contract month", plot_bgcolor="#F7F9FB", paper_bgcolor="white")
+            st.plotly_chart(fcv, width="stretch")
+        with cc2:
+            fx_exps = dl.futures_oi_expiries(code)
+            fx_def = dl.futures_oi_front(code)
+            fx_ix = fx_exps.index(fx_def) if fx_def in fx_exps else len(fx_exps) - 1
+            sel_fx = st.selectbox("Contract — OI over its life", fx_exps, index=fx_ix, key="fut_oi_exp")
+            fser = _fut_series(code, sel_fx).loc[s:e]
+            ffs = go.Figure(go.Scatter(x=fser.index, y=fser, line=dict(color="#1E6B7A", width=1.9),
+                                       fill="tozeroy", fillcolor="rgba(30,107,122,0.08)", name="OI"))
+            ffs.update_layout(height=330, title=f"{sel_fx} futures — open interest",
+                              margin=dict(l=50, r=20, t=40, b=30), yaxis_title="Open interest",
+                              plot_bgcolor="#F7F9FB", paper_bgcolor="white")
+            st.plotly_chart(ffs, width="stretch")
+        tot = curve["open_interest"].sum()
+        front = curve.sort_values("open_interest", ascending=False).iloc[0] if not curve.empty else None
+        d1, d2 = st.columns(2)
+        d1.metric("Total futures OI (all contracts)", f"{tot:,.0f}", help=f"Snapshot {snap:%Y-%m-%d}")
+        if front is not None:
+            d2.metric("Most-active contract", f"{front['expiry_ym']}", f"{front['open_interest']:,.0f} OI")
+        st.divider()
+    else:
+        st.caption(f"Per-contract futures OI not available for {commodity} yet "
+                   "(gold only). Market-level COT shown below.")
+
+    # ── Futures market positioning (CFTC COT) ────────────────────────────────
+    st.subheader("Futures — market positioning (CFTC COT)")
     cot = _cot(code).loc[s:e]
     if cot.empty:
         st.info("No COT data in the selected date range (try widening it).")

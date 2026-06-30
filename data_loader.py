@@ -236,6 +236,51 @@ def load_cot(code: str) -> pd.DataFrame:
     return df.sort_values("date").set_index("date")[keep]
 
 
+# ── FUTURES OPEN INTEREST PER CONTRACT (exchange, by expiry) ──────────────────
+def has_futures_oi(code: str) -> bool:
+    """True if a per-contract futures-OI snapshot file exists for this code."""
+    return _parquet(code, "futures_oi").exists()
+
+
+def load_futures_oi(code: str) -> pd.DataFrame:
+    """Per-futures-contract open interest. Columns: date, expiry_ym,
+    open_interest, settle (one row per contract per date)."""
+    df = pd.read_parquet(_parquet(code, "futures_oi"))
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values("date")
+
+
+def futures_oi_curve(code: str) -> tuple[pd.DataFrame, pd.Timestamp]:
+    """Latest-snapshot OI per futures expiry (the OI term structure).
+    Returns (df[expiry_ym, open_interest, settle] sorted by expiry, snapshot_date)."""
+    df = load_futures_oi(code)
+    snap = df["date"].max()
+    cur = df[(df["date"] == snap) & (df["open_interest"] > 0)].copy()
+    return cur.sort_values("expiry_ym"), snap
+
+
+def futures_oi_expiries(code: str, min_obs: int = 20) -> list[str]:
+    """Futures contract months (YYYY-MM) with enough OI history, chronological."""
+    df = load_futures_oi(code)
+    counts = df.groupby("expiry_ym")["date"].size()
+    return sorted(str(e) for e in counts[counts >= min_obs].index)
+
+
+def futures_oi_front(code: str) -> str:
+    """The most-active futures contract in the latest snapshot (max OI)."""
+    cur, _ = futures_oi_curve(code)
+    if cur.empty:
+        return ""
+    return str(cur.sort_values("open_interest", ascending=False)["expiry_ym"].iloc[0])
+
+
+def futures_oi_series(code: str, expiry_ym: str) -> pd.Series:
+    """Open interest over time for one futures contract, indexed by date."""
+    df = load_futures_oi(code)
+    s = df[df["expiry_ym"].astype(str) == expiry_ym].set_index("date")["open_interest"]
+    return s[s > 0].sort_index()
+
+
 # ── 25-DELTA SKEW (per-tenor smile summary over time) ─────────────────────────
 def load_skew(code: str, rank: int) -> pd.DataFrame:
     """25Δ skew time-series for a continuous tenor. skew_ts rank is 1-based
